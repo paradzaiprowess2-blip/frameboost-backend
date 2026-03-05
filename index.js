@@ -12,10 +12,24 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Setup file upload
+// Setup file upload with streaming
 const upload = multer({
   dest: "uploads/",
-  limits: { fileSize: 200 * 1024 * 1024 } // 200 MB
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = "uploads/";
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => {
+      // Generate unique filename
+      const uniqueName = `${Date.now()}-${Math.random().toString(36).substring(7)}-${file.originalname}`;
+      cb(null, uniqueName);
+    }
+  })
 });
 
 // Ensure uploads directory exists
@@ -42,14 +56,82 @@ function checkFFmpegAvailable() {
   });
 }
 
-// Video processing endpoint
+// Get video info endpoint (returns FPS, duration, resolution)
+app.post("/video-info", upload.single("video"), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const inputFile = req.file.path;
+
+    console.log(`[FFprobe] Analyzing: ${inputFile}`);
+
+    // Use ffprobe to get video information
+    execFile('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=r_frame_rate,width,height,duration',
+      '-of', 'json',
+      inputFile
+    ], { maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+      // Clean up input file
+      fs.unlink(inputFile, (err) => {
+        if (err) console.error("[Cleanup Error]", err);
+      });
+
+      if (error) {
+        console.error("[FFprobe Error]", error.message);
+        return res.status(500).json({ 
+          error: "Failed to analyze video",
+          details: error.message 
+        });
+      }
+
+      try {
+        const data = JSON.parse(stdout);
+        const stream = data.streams?.[0];
+
+        if (!stream) {
+          return res.status(400).json({ error: "No video stream found" });
+        }
+
+        // Parse frame rate (e.g., "30/1" or "24000/1001")
+        let fps = 30;
+        if (stream.r_frame_rate) {
+          const [num, den] = stream.r_frame_rate.split('/').map(Number);
+          fps = Math.round(num / den);
+        }
+
+        const videoInfo = {
+          fps: fps,
+          width: stream.width || 0,
+          height: stream.height || 0,
+          duration: stream.duration ? parseFloat(stream.duration) : 0,
+        };
+
+        console.log(`[FFprobe] Video info:`, videoInfo);
+        res.json(videoInfo);
+      } catch (parseError) {
+        console.error("[Parse Error]", parseError);
+        res.status(500).json({ error: "Failed to parse video info" });
+      }
+    });
+
+  } catch (err) {
+    console.error("[Server Error]", err);
+    res.status(500).json({ error: "Processing error", details: err.message });
+  }
+});
+
+// Video processing endpoint (optimized for streaming)
 app.post("/process-video", upload.single("video"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    // Get target FPS from request body (sent by frontend)
+    // Get target FPS from request body
     const targetFps = parseInt(req.body.targetFps) || 60;
     
     console.log(`[Backend] Received: video=${req.file.originalname}, targetFps=${targetFps}`);
@@ -80,13 +162,26 @@ app.post("/process-video", upload.single("video"), async (req, res) => {
 
     console.log(`[FFmpeg] Processing: ${inputFile} → ${outputFile} at ${targetFps} FPS`);
 
-    // Run FFmpeg with proper escaping
+    // Use streaming FFmpeg command to avoid memory issues
+    // -c:v libx264 = H.264 codec (good compression)
+    // -preset fast = faster encoding (less CPU intensive)
+    // -crf 23 = quality (lower = better, 23 is default)
+    // -c:a aac = audio codec
+    // -movflags +faststart = optimize for streaming
     execFile('ffmpeg', [
       '-i', inputFile,
-      '-filter:v', `minterpolate=fps=${targetFps}`,
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-filter:v', `fps=${targetFps}`,
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-movflags', '+faststart',
       '-y', // Overwrite output file
       outputFile
-    ], { maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+    ], { 
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 10 * 60 * 1000 // 10 minutes
+    }, (error, stdout, stderr) => {
       if (error) {
         console.error("[FFmpeg Error]", error.message);
         console.error("[FFmpeg Stderr]", stderr);
@@ -120,21 +215,35 @@ app.post("/process-video", upload.single("video"), async (req, res) => {
       // Send the processed video with proper headers
       res.setHeader('Content-Type', 'video/mp4');
       res.setHeader('Content-Disposition', `attachment; filename="processed_${targetFps}fps.mp4"`);
+      res.setHeader('Content-Length', stats.size);
       
-      res.download(outputFile, `processed_${targetFps}fps.mp4`, (err) => {
-        if (err) {
-          console.error("[Download Error]", err);
-        }
-        
-        // Clean up files after download completes
+      // Use streaming to avoid loading entire file into memory
+      const fileStream = fs.createReadStream(outputFile);
+      
+      fileStream.on('error', (err) => {
+        console.error("[Stream Error]", err);
+        res.status(500).json({ error: "Failed to stream video" });
+      });
+
+      fileStream.pipe(res);
+
+      // Clean up files after streaming completes
+      res.on('finish', () => {
+        console.log("[Cleanup] Response finished, cleaning up files");
         setTimeout(() => {
           fs.unlink(inputFile, (err) => {
             if (err) console.error("[Cleanup Error] Failed to delete input:", err);
+            else console.log("[Cleanup] Input file deleted");
           });
           fs.unlink(outputFile, (err) => {
             if (err) console.error("[Cleanup Error] Failed to delete output:", err);
+            else console.log("[Cleanup] Output file deleted");
           });
         }, 1000);
+      });
+
+      res.on('error', (err) => {
+        console.error("[Response Error]", err);
       });
     });
 
